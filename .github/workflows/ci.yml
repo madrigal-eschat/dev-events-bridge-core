@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  commitlint:
+    if: github.event_name == 'pull_request'
+    uses: madrigal-eschat/ci-workflows/.github/workflows/_commitlint.yml@901ba5472928a008524b102bfbdd2fb98637aef2 # v1.2.0
+    with:
+      from-sha: ${{ github.event.pull_request.base.sha }}
+      to-sha: ${{ github.event.pull_request.head.sha }}
+
+  ci:
+    uses: madrigal-eschat/ci-workflows/.github/workflows/_rust-ci.yml@901ba5472928a008524b102bfbdd2fb98637aef2 # v1.2.0
+
+  coverage:
+    if: github.event_name == 'pull_request'
+    uses: madrigal-eschat/ci-workflows/.github/workflows/_rust-coverage.yml@901ba5472928a008524b102bfbdd2fb98637aef2 # v1.2.0
+    with:
+      base-ref: ${{ github.base_ref }}
+
+  gitleaks:
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: madrigal-eschat/ci-workflows/.github/workflows/_gitleaks.yml@901ba5472928a008524b102bfbdd2fb98637aef2 # v1.2.0
+
+  markdown-lint:
+    uses: madrigal-eschat/ci-workflows/.github/workflows/_markdown-lint.yml@901ba5472928a008524b102bfbdd2fb98637aef2 # v1.2.0
+    with:
+      files: README.md
+
+  prose-lint:
+    uses: madrigal-eschat/ci-workflows/.github/workflows/_prose-lint.yml@901ba5472928a008524b102bfbdd2fb98637aef2 # v1.2.0
+    with:
+      files: README.md
+
+  semantic-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [ci, gitleaks, markdown-lint, prose-lint]
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: madrigal-eschat/ci-workflows/.github/workflows/_semrel.yml@901ba5472928a008524b102bfbdd2fb98637aef2 # v1.2.0
+    secrets:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
