@@ -69,10 +69,8 @@ pub async fn handle_message<A: Action>(
             continue;
         }
         matched_any = true;
-        log::debug!(
-            "rule[{index}] matched event {:?} on {topic}",
-            cloud_event.type_
-        );
+        let event_type = &cloud_event.type_;
+        log::debug!("rule[{index}] matched event {event_type:?} on {topic}");
         rule.action.apply(ctx, &cloud_event).await?;
     }
 
