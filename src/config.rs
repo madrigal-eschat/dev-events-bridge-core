@@ -1,84 +1,34 @@
-use crate::{backend, event::CloudEvent, gestures};
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 use std::collections::HashMap;
 
+use anyhow::Result;
+use serde::Deserialize;
+
+use crate::CloudEvent;
+
 #[derive(Debug, Deserialize)]
-pub struct Config {
-    pub broker: BrokerConfig,
+pub struct CoreConfig<A> {
+    pub broker: Broker,
     pub topics: Vec<String>,
-    pub rules: Vec<Rule>,
-    pub http: Option<HttpConfig>,
-    pub buttplug: Option<ButtplugConfig>,
+    pub rules: Vec<Rule<A>>,
 }
 
-impl Config {
+impl<A> CoreConfig<A> {
+    /// Validate shared configuration. The inherited schema imposes no additional
+    /// validation beyond deserialization. MQTT checks subscriptions when queued.
     pub fn validate(&self) -> Result<()> {
-        for rule in &self.rules {
-            let devices = rule.device_spec.as_slice();
-            if devices.is_empty() {
-                bail!("rule has empty devices list");
-            }
-            for addr in devices {
-                let backend_name = addr.split_once('/').context("device must be BACKEND/ID")?.0;
-                if !backend::is_known(backend_name) {
-                    bail!("unknown backend '{}' in device '{}'", backend_name, addr);
-                }
-            }
-            let gesture_events = match gestures::lookup(&rule.gesture.name) {
-                Some(g) => g,
-                None => bail!("unknown gesture '{}'", rule.gesture.name),
-            };
-            if rule.gesture.speed <= 0.0 {
-                bail!(
-                    "rules[].gesture.speed must be > 0 (got {} for gesture '{}')",
-                    rule.gesture.speed,
-                    rule.gesture.name,
-                );
-            }
-            if rule.gesture.scale <= 0.0 {
-                bail!(
-                    "rules[].gesture.scale must be > 0 (got {} for gesture '{}')",
-                    rule.gesture.scale,
-                    rule.gesture.name,
-                );
-            }
-            let max_idx = gesture_events
-                .iter()
-                .map(|e| e.device as usize)
-                .max()
-                .unwrap_or(0);
-            let needed = max_idx + 1;
-            if devices.len() != needed {
-                bail!(
-                    "gesture '{}' needs {} device(s) (indices 0..={}) but rule specifies {}",
-                    rule.gesture.name,
-                    needed,
-                    max_idx,
-                    devices.len(),
-                );
-            }
-        }
-        if let Some(buttplug) = &self.buttplug {
-            if buttplug.scan_interval_ms == 0 {
-                bail!(
-                    "buttplug.scan_interval_ms must be > 0 (got {})",
-                    buttplug.scan_interval_ms,
-                );
-            }
-            if buttplug.connection_timeout_ms == 0 {
-                bail!(
-                    "buttplug.connection_timeout_ms must be > 0 (got {})",
-                    buttplug.connection_timeout_ms,
-                );
-            }
-        }
         Ok(())
     }
 }
 
 #[derive(Debug, Deserialize)]
-pub struct BrokerConfig {
+pub struct Rule<A> {
+    pub filter: Filter,
+    #[serde(flatten)]
+    pub action: A,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Broker {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
@@ -90,95 +40,10 @@ fn default_port() -> u16 {
     1883
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct HttpConfig {
-    #[serde(default = "default_http_bind")]
-    pub bind: String,
-}
-
-fn default_http_bind() -> String {
-    "127.0.0.1:8080".to_string()
-}
-
-/// Manual impl (not derived) because `#[serde(default = "default_http_bind")]`
-/// only applies during deserialization of a present `http:` section — it has
-/// no effect on `Default::default()`, which is what `unwrap_or_default()` uses
-/// when the whole `http:` section is absent from the config.
-impl Default for HttpConfig {
-    fn default() -> Self {
-        Self {
-            bind: default_http_bind(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ButtplugConfig {
-    #[serde(default = "default_buttplug_server")]
-    pub server: String,
-    #[serde(default = "default_buttplug_connection_timeout_ms")]
-    pub connection_timeout_ms: u64,
-    #[serde(default = "default_buttplug_max_backoff_ms")]
-    pub max_backoff_ms: u64,
-    #[serde(default = "default_buttplug_scan_interval_ms")]
-    pub scan_interval_ms: u64,
-}
-
-fn default_buttplug_server() -> String {
-    "ws://localhost:12345".to_string()
-}
-
-fn default_buttplug_connection_timeout_ms() -> u64 {
-    5000
-}
-
-fn default_buttplug_max_backoff_ms() -> u64 {
-    30000
-}
-
-fn default_buttplug_scan_interval_ms() -> u64 {
-    30000
-}
-
-impl Default for ButtplugConfig {
-    fn default() -> Self {
-        Self {
-            server: default_buttplug_server(),
-            connection_timeout_ms: default_buttplug_connection_timeout_ms(),
-            max_backoff_ms: default_buttplug_max_backoff_ms(),
-            scan_interval_ms: default_buttplug_scan_interval_ms(),
-        }
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {
     pub username: String,
     pub password: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Rule {
-    pub filter: Filter,
-    pub gesture: GestureConfig,
-    #[serde(flatten)]
-    pub device_spec: DeviceSpec,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum DeviceSpec {
-    One { device: String },
-    Many { devices: Vec<String> },
-}
-
-impl DeviceSpec {
-    pub fn as_slice(&self) -> &[String] {
-        match self {
-            DeviceSpec::One { device } => std::slice::from_ref(device),
-            DeviceSpec::Many { devices } => devices,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -254,211 +119,10 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct GestureConfig {
-    pub name: String,
-    #[serde(default = "one")]
-    pub scale: f32,
-    #[serde(default = "one")]
-    pub speed: f32,
-}
-
-fn one() -> f32 {
-    1.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn rule(device: &str, gesture: &str, speed: f32, scale: f32) -> Rule {
-        Rule {
-            device_spec: DeviceSpec::One {
-                device: device.into(),
-            },
-            filter: Filter::default(),
-            gesture: GestureConfig {
-                name: gesture.into(),
-                speed,
-                scale,
-            },
-        }
-    }
-
-    fn rule2(d0: &str, d1: &str, gesture: &str) -> Rule {
-        Rule {
-            device_spec: DeviceSpec::Many {
-                devices: vec![d0.into(), d1.into()],
-            },
-            filter: Filter::default(),
-            gesture: GestureConfig {
-                name: gesture.into(),
-                speed: 1.0,
-                scale: 1.0,
-            },
-        }
-    }
-
-    fn cfg(rules: Vec<Rule>) -> Config {
-        Config {
-            broker: BrokerConfig {
-                host: "localhost".into(),
-                port: 1883,
-                client_id: None,
-                auth: None,
-            },
-            topics: vec![],
-            rules,
-            http: None,
-            buttplug: None,
-        }
-    }
-
-    fn valid() -> Rule {
-        rule("stdout/0", "pulse_short", 1.0, 1.0)
-    }
-
-    fn valid2() -> Rule {
-        rule2("stdout/0", "stdout/1", "stop_all")
-    }
-
-    // ── Config::validate ───────────────────────────────────────────────────
-
-    #[test]
-    fn validate_valid_rule() {
-        assert!(cfg(vec![valid()]).validate().is_ok());
-    }
-
-    #[test]
-    fn validate_empty_rules() {
-        assert!(cfg(vec![]).validate().is_ok());
-    }
-
-    #[test]
-    fn validate_missing_slash_in_device() {
-        let err = cfg(vec![rule("stdout", "pulse_short", 1.0, 1.0)])
-            .validate()
-            .unwrap_err();
-        assert!(err.to_string().contains("BACKEND/ID"));
-    }
-
-    #[test]
-    fn validate_unknown_backend() {
-        let err = cfg(vec![rule("nfc/0", "pulse_short", 1.0, 1.0)])
-            .validate()
-            .unwrap_err();
-        assert!(err.to_string().contains("nfc"));
-    }
-
-    #[test]
-    fn validate_unknown_gesture() {
-        let err = cfg(vec![rule("stdout/0", "nonexistent", 1.0, 1.0)])
-            .validate()
-            .unwrap_err();
-        assert!(err.to_string().contains("nonexistent"));
-    }
-
-    #[test]
-    fn validate_speed_zero() {
-        let err = cfg(vec![rule("stdout/0", "pulse_short", 0.0, 1.0)])
-            .validate()
-            .unwrap_err();
-        assert!(err.to_string().contains("speed"));
-    }
-
-    #[test]
-    fn validate_speed_negative() {
-        let err = cfg(vec![rule("stdout/0", "pulse_short", -1.0, 1.0)])
-            .validate()
-            .unwrap_err();
-        assert!(err.to_string().contains("speed"));
-    }
-
-    #[test]
-    fn validate_scale_zero() {
-        let err = cfg(vec![rule("stdout/0", "pulse_short", 1.0, 0.0)])
-            .validate()
-            .unwrap_err();
-        assert!(err.to_string().contains("scale"));
-    }
-
-    #[test]
-    fn validate_scale_negative() {
-        let err = cfg(vec![rule("stdout/0", "pulse_short", 1.0, -0.5)])
-            .validate()
-            .unwrap_err();
-        assert!(err.to_string().contains("scale"));
-    }
-
-    #[test]
-    fn validate_two_device_gesture_valid() {
-        assert!(cfg(vec![valid2()]).validate().is_ok());
-    }
-
-    #[test]
-    fn validate_device_count_too_few() {
-        // stop_all needs 2 devices but only 1 given
-        let err = cfg(vec![rule("stdout/0", "stop_all", 1.0, 1.0)])
-            .validate()
-            .unwrap_err();
-        assert!(err.to_string().contains("needs 2"));
-    }
-
-    #[test]
-    fn validate_device_count_too_many() {
-        // pulse_short needs 1 device but 2 given
-        let err = cfg(vec![rule2("stdout/0", "stdout/1", "pulse_short")])
-            .validate()
-            .unwrap_err();
-        assert!(err.to_string().contains("needs 1"));
-    }
-
-    #[test]
-    fn validate_buttplug_valid() {
-        let mut c = cfg(vec![valid()]);
-        c.buttplug = Some(ButtplugConfig::default());
-        assert!(c.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_buttplug_scan_interval_zero() {
-        let mut c = cfg(vec![valid()]);
-        c.buttplug = Some(ButtplugConfig {
-            scan_interval_ms: 0,
-            ..ButtplugConfig::default()
-        });
-        let err = c.validate().unwrap_err();
-        assert!(err.to_string().contains("scan_interval_ms"));
-        assert!(err.to_string().contains('0'));
-    }
-
-    #[test]
-    fn validate_buttplug_connection_timeout_zero() {
-        let mut c = cfg(vec![valid()]);
-        c.buttplug = Some(ButtplugConfig {
-            connection_timeout_ms: 0,
-            ..ButtplugConfig::default()
-        });
-        let err = c.validate().unwrap_err();
-        assert!(err.to_string().contains("connection_timeout_ms"));
-        assert!(err.to_string().contains('0'));
-    }
-
-    #[test]
-    fn validate_empty_devices_list() {
-        let r = Rule {
-            device_spec: DeviceSpec::Many { devices: vec![] },
-            filter: Filter::default(),
-            gesture: GestureConfig {
-                name: "pulse_short".into(),
-                speed: 1.0,
-                scale: 1.0,
-            },
-        };
-        let err = cfg(vec![r]).validate().unwrap_err();
-        assert!(err.to_string().contains("empty"));
-    }
 
     fn event(
         type_: &str,
@@ -639,6 +303,8 @@ mod tests {
         };
         let e = event("t", "s", "editor", Some("~/projects/my-app"), json!({}));
         assert!(f.matches(&e));
+        let e = event("t", "s", "editor", Some("~/other/my-app"), json!({}));
+        assert!(!f.matches(&e));
     }
 
     #[test]
@@ -686,99 +352,5 @@ mod tests {
             ..Default::default()
         };
         assert!(!f2.matches(&any_event()));
-    }
-
-    #[test]
-    fn parse_config_without_http_section() {
-        let yaml = r#"
-broker:
-  host: localhost
-topics: []
-rules: []
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg.http.is_none());
-    }
-
-    #[test]
-    fn parse_config_with_http_section_defaults_bind() {
-        let yaml = r#"
-broker:
-  host: localhost
-topics: []
-rules: []
-http: {}
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.http.unwrap().bind, "127.0.0.1:8080");
-    }
-
-    #[test]
-    fn parse_config_with_http_section_custom_bind() {
-        let yaml = r#"
-broker:
-  host: localhost
-topics: []
-rules: []
-http:
-  bind: "0.0.0.0:9000"
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.http.unwrap().bind, "0.0.0.0:9000");
-    }
-
-    #[test]
-    fn parse_config_without_buttplug_section() {
-        let yaml = r#"
-broker:
-  host: localhost
-topics: []
-rules: []
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg.buttplug.is_none());
-    }
-
-    #[test]
-    fn parse_config_with_buttplug_defaults() {
-        let yaml = r#"
-broker:
-  host: localhost
-topics: []
-rules: []
-buttplug: {}
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        let buttplug = cfg.buttplug.unwrap();
-        assert_eq!(buttplug.server, "ws://localhost:12345");
-        assert_eq!(buttplug.connection_timeout_ms, 5000);
-        assert_eq!(buttplug.max_backoff_ms, 30000);
-        assert_eq!(buttplug.scan_interval_ms, 30000);
-    }
-
-    #[test]
-    fn buttplug_config_default_yields_documented_values() {
-        let buttplug = ButtplugConfig::default();
-        assert_eq!(buttplug.server, "ws://localhost:12345");
-        assert_eq!(buttplug.connection_timeout_ms, 5000);
-        assert_eq!(buttplug.max_backoff_ms, 30000);
-        assert_eq!(buttplug.scan_interval_ms, 30000);
-    }
-
-    #[test]
-    fn http_config_default_yields_documented_bind() {
-        // Regression test: when config.http is None, unwrap_or_default() must
-        // yield the documented bind address, not an empty string.
-        let yaml = r#"
-broker:
-  host: localhost
-topics: []
-rules: []
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg.http.is_none());
-        // This is what backend/mod.rs does: unwrap_or_default() when http is None
-        let bind = cfg.http.clone().unwrap_or_default().bind;
-        assert_eq!(bind, "127.0.0.1:8080");
     }
 }
